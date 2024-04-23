@@ -6,51 +6,43 @@ const FIRST_WEIGHT_L2_L3: u32 = (0x20 << 16) | (0x02 << 25);
 
 /// рассчитать вычисляемые веса и добавить их к результату (представленному в виде u32)
 #[inline(never)]
-pub fn push_implicit_weights(code: u32, result: &mut Vec<u32>)
+pub fn implicit_weights(code: u32) -> [u32; 2]
 {
     // сначала проверим хань
 
     if is_han_core(code) {
-        result.push((0xFB40 + (code >> 15)) | FIRST_WEIGHT_L2_L3);
-        result.push((code & 0x7FFF) | 0x8000);
-
-        return;
+        return [
+            (0xFB40 + (code >> 15)) | FIRST_WEIGHT_L2_L3,
+            (code & 0x7FFF) | 0x8000,
+        ];
     }
 
     if is_han_other(code) {
-        result.push((0xFB80 + (code >> 15)) | FIRST_WEIGHT_L2_L3);
-        result.push((code & 0x7FFF) | 0x8000);
-
-        return;
+        return [
+            (0xFB80 + (code >> 15)) | FIRST_WEIGHT_L2_L3,
+            (code & 0x7FFF) | 0x8000,
+        ];
     }
 
     // вымершие языки. вообще, можно смело выкинуть этот блок для оптимизации
 
     if is_tangut(code) {
-        result.push(0xFB00 | FIRST_WEIGHT_L2_L3);
-        result.push((code - 0x17000) | 0x8000);
-
-        return;
+        return [0xFB00 | FIRST_WEIGHT_L2_L3, (code - 0x17000) | 0x8000];
     }
 
     if is_nushu(code) {
-        result.push(0xFB01 | FIRST_WEIGHT_L2_L3);
-        result.push((code - 0x1B170) | 0x8000);
-
-        return;
+        return [0xFB01 | FIRST_WEIGHT_L2_L3, (code - 0x1B170) | 0x8000];
     }
-    
-    if is_khitan(code) {
-        result.push(0xFB02 | FIRST_WEIGHT_L2_L3);
-        result.push((code - 0x18B00) | 0x8000);
 
-        return;
+    if is_khitan(code) {
+        return [0xFB02 | FIRST_WEIGHT_L2_L3, (code - 0x18B00) | 0x8000];
     }
 
     // любой другой кодпоинт
-
-    result.push((0xFBC0 + (code >> 15)) | FIRST_WEIGHT_L2_L3);
-    result.push((code & 0x7FFF) | 0x8000);
+    [
+        (0xFBC0 + (code >> 15)) | FIRST_WEIGHT_L2_L3,
+        (code & 0x7FFF) | 0x8000,
+    ]
 }
 
 /// Основные иероглифы унификации Хань

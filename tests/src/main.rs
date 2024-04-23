@@ -13,10 +13,10 @@ use unicode_data::{
 fn test()
 {
     /*
-     
+        77249. 0439 (0) 0334 (1)  - (й) CYRILLIC SMALL LETTER SHORT I
     */
     let collator = Collator::cldr_und();
-    let test_num = 109660;
+    let test_num = 77249;
 
     /*
 

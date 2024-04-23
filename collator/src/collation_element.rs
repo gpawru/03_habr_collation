@@ -1,5 +1,4 @@
-use crate::slice::trie::TrieNode;
-
+/// элемент сопоставления
 #[derive(Debug, Clone, Copy)]
 pub struct CollationElement
 {
@@ -11,24 +10,14 @@ pub struct CollationElement
 #[derive(Debug, Clone, Copy)]
 pub enum CollationElementValue
 {
+    /// одиночные веса
     SingleWeights(u32),
+    /// декомпозиция
     Decomposition(u16),
+    /// кодпоинт - начало последовательности
     Trie(u16),
+    /// элемент с весами, записанными в таблице tries
     TrieWeights(u16, u8),
-}
-
-impl From<TrieNode> for CollationElement
-{
-    /// элемент сопоставления из trie
-    #[inline(always)]
-    fn from(node: TrieNode) -> Self
-    {
-        Self {
-            ccc: node.ccc(),
-            code: node.code(),
-            value: CollationElementValue::TrieWeights(node.weights_offset(), node.weights_len()),
-        }
-    }
 }
 
 impl CollationElement

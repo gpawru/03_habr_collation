@@ -1,5 +1,9 @@
 use core::fmt::Debug;
 
+mod output;
+
+pub use output::output_weights;
+
 /// веса для кодпоинта, 3 уровня
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Weights

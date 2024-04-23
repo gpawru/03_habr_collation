@@ -1,28 +1,18 @@
+use codepoint::{CodepointWithData, CodepointsIter};
 use collation_element::{CollationElement, CollationElementValue};
 use data::WeightsData;
-use implicit::push_implicit_weights;
-use slice::{
-    aligned::Aligned,
-    iter::CharsIter,
-    trie::{TrieIter, TrieNode},
-};
+use implicit::implicit_weights;
+use slice::aligned::Aligned;
+use trie::{TrieIter, TrieNode};
+use weights::output_weights;
 
+mod codepoint;
 mod collation_element;
 mod data;
 mod implicit;
 mod slice;
-mod utf8;
+mod trie;
 mod weights;
-
-/// блок последнего кодпоинта с весами / декомпозицией (U+2FA1D)
-pub const LAST_CODEPOINT_BLOCK: u16 = (0x2FA1D >> (18 - 11)) as u16;
-/// блок U+E0000 .. U+E0200 сдвинут, чтобы уменьшить размер индекса
-pub const IGNORABLES_BLOCKS: core::ops::Range<u16> = 0x1C00 .. 0x1C04;
-pub const IGNORABLES_SHIFT: u16 = 0x160B;
-
-pub const MARKER_MASK: u8 = 0b_111;
-pub const MARKER_CCC_HANGUL: u8 = 0xFE;
-pub const MARKER_CCC_SEQUENCE: u8 = 0xFF;
 
 /// веса считаются алгоритмически
 pub const MARKER_IMPLICIT: u8 = 0b_000;
@@ -31,28 +21,33 @@ pub const MARKER_IMPLICIT: u8 = 0b_000;
 pub const MARKER_STARTER_SINGLE_WEIGHTS: u8 = 0b_001;
 /// стартер, расширение
 pub const MARKER_STARTER_EXPANSION: u8 = 0b_010;
-/// декомпозиция, начинается со стартера или начало последовательности (сокращение или many-to-many)
-pub const MARKER_STARTER_DECOMPOSITION_OR_TRIE: u8 = 0b_011;
+/// декомпозиция, начинается со стартера
+pub const MARKER_STARTER_DECOMPOSITION: u8 = 0b_011;
+/// стартер, начало последовательности (сокращение или many-to-many)
+pub const MARKER_STARTER_TRIE: u8 = 0b100;
 
 /// обычный нестартер, одинарные веса
-pub const MARKER_NONSTARTER_SINGLE_WEIGHTS: u8 = 0b_100;
+pub const MARKER_NONSTARTER_SINGLE_WEIGHTS: u8 = 0b_101;
 /// нестартер - расширение, сокращение или декомпозиция
-pub const MARKER_NONSTARTER_TRIE: u8 = 0b_101;
+pub const MARKER_NONSTARTER_TRIE: u8 = 0b_110;
+
+/// частный случай декомпозиции - кодпоинт - слог хангыль
+pub const MARKER_CCC_HANGUL: u8 = 0xFF;
 
 /// коллатор
 #[repr(C, align(16))]
 pub struct Collator<'a>
 {
+    /// расширения
+    expansions: Aligned<'a, u32>,
+    /// сокращения, many-to-many, декомпозиции
+    tries: Aligned<'a, u32>,
     /// стартеры и нестартеры с одинарными весами
     scalars64: Aligned<'a, u64>,
     /// декомпозиции, сокращения и т.д.
     scalars32: Aligned<'a, u32>,
     /// индексы
     index: Aligned<'a, u16>,
-    /// расширения
-    pub expansions: Aligned<'a, u32>,
-    /// сокращения, many-to-many, декомпозиции
-    pub tries: Aligned<'a, u32>,
     /// с U+0000 и до этого кодпоинта включительно блоки в data идут последовательно
     continuous_block_end: u32,
 }
@@ -74,10 +69,18 @@ impl<'a> Collator<'a>
     #[inline(always)]
     pub fn get_weights(&self, input: &str) -> Vec<u32>
     {
-        let mut iter = CharsIter::new(input);
-        let mut result = Vec::<u32>::with_capacity(input.len());
+        let mut codepoints = CodepointsIter::new(
+            input,
+            &self.scalars64,
+            &self.scalars32,
+            &self.index,
+            self.continuous_block_end,
+        );
 
-        self.ce_buffer_loop(&mut iter, &mut result);
+        let mut result = Vec::<u32>::with_capacity(input.len());
+        let mut buffer = Vec::<CollationElement>::new();
+
+        self.ce_buffer_loop(&mut codepoints, &mut result, &mut buffer);
 
         result
     }
@@ -86,193 +89,157 @@ impl<'a> Collator<'a>
     #[inline(always)]
     fn starters_loop(
         &self,
-        iter: &mut CharsIter,
+        codepoints: &mut CodepointsIter,
         result: &mut Vec<u32>,
-        buffer_not_empty: bool,
-    ) -> Option<(u32, u64)>
+    ) -> Option<CodepointWithData>
     {
         loop {
-            let code = unsafe { utf8::next_char(iter)? };
-            let data_value = self.get_data_value(code);
+            let codepoint = codepoints.next()?;
 
-            if buffer_not_empty {
-                return Some((code, data_value));
-            }
-
-            let marker = data_value as u8 & MARKER_MASK;
-
-            match marker {
+            match codepoint.marker() {
                 // стартеры, синглтоны
                 MARKER_STARTER_SINGLE_WEIGHTS => {
-                    result.push((data_value >> 4) as u32);
+                    result.push(codepoint.single_weights());
                 }
                 // расширения стартеров
                 MARKER_STARTER_EXPANSION => {
-                    result.extend_from_slice(
-                        self.get_starter_expansion_weights_slice(data_value as u32),
-                    );
+                    result.extend_from_slice(codepoint.expansion_weights(&self.expansions))
                 }
                 // прочие кейсы
-                _ => return Some((code, data_value)),
+                _ => return Some(codepoint),
             }
         }
     }
 
     /// цикл с использованием буфера кодпоинтов (не делаем декомпозицию, когда она не нужна)
     #[inline(always)]
-    fn ce_buffer_loop(&'a self, iter: &mut CharsIter, result: &mut Vec<u32>)
+    fn ce_buffer_loop(
+        &'a self,
+        codepoints: &mut CodepointsIter,
+        result: &mut Vec<u32>,
+        buffer: &mut Vec<CollationElement>,
+    )
     {
-        let buffer = &mut Vec::<CollationElement>::new();
-        let mut last_ccc = 0;
+        let mut previous_ccc = 0;
         let mut previous = None;
 
         loop {
-            let (code, data_value) = match previous {
-                Some(values) => {
-                    previous = None;
-                    values
-                }
-                None => match self.starters_loop(iter, result, !buffer.is_empty()) {
-                    Some(e) => e,
-                    None => {
-                        if !buffer.is_empty() {
-                            self.handle_buffer(result, buffer, last_ccc != 0xFF);
+            // самый частый случай - последовательно идущие обычные стартеры, для них - цикл без избыточных проверок
+            let codepoint = match previous {
+                None => match buffer.is_empty() {
+                    true => match self.starters_loop(codepoints, result) {
+                        Some(codepoint) => codepoint,
+                        None => return,
+                    },
+                    false => match codepoints.next() {
+                        Some(codepoint) => codepoint,
+                        None => {
+                            self.handle_buffer(result, buffer, previous_ccc != 0xFF);
+                            return;
                         }
-                        return;
-                    }
+                    },
                 },
+                Some(codepoint) => {
+                    previous = None;
+                    codepoint
+                }
             };
 
-            let marker = data_value as u8 & MARKER_MASK;
-
-            match marker {
+            match codepoint.marker() {
                 // стартеры, синглтоны
                 MARKER_STARTER_SINGLE_WEIGHTS => {
-                    self.handle_buffer(result, buffer, last_ccc != 0xFF);
-                    result.push((data_value >> 4) as u32);
+                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    last_ccc = 0;
+                    result.push(codepoint.single_weights());
+
+                    previous_ccc = 0;
                 }
                 // расширения стартеров
                 MARKER_STARTER_EXPANSION => {
-                    // сокращение из двух стартеров (и, возможно, нестартера)?
-                    self.handle_buffer(result, buffer, last_ccc != 0xFF);
-                    result.extend_from_slice(
-                        self.get_starter_expansion_weights_slice(data_value as u32),
-                    );
+                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    last_ccc = 0;
+                    result.extend_from_slice(codepoint.expansion_weights(&self.expansions));
+
+                    previous_ccc = 0;
                 }
-                // декомпозиция, начинается со стартера или начало последовательности (сокращение или many-to-many)
-                MARKER_STARTER_DECOMPOSITION_OR_TRIE => {
-                    if !buffer.is_empty() {
-                        self.handle_buffer(result, buffer, last_ccc != 0xFF);
-                    }
+                // декомпозиция, начинается со стартера
+                MARKER_STARTER_DECOMPOSITION => {
+                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    let (pos, ccc) = parse_expansion_or_trie_info(data_value as u32);
-                    last_ccc = ccc;
+                    previous_ccc = match codepoint.ccc_or_len() {
+                        // частный случай - слог хангыль
+                        MARKER_CCC_HANGUL => {
+                            // TODO
+                            // self.handle_hangul_syllable(code, result);
+                            0
+                        }
+                        ccc => {
+                            buffer.push(codepoint.as_ce_decomposition());
+                            ccc
+                        }
+                    };
+                }
+                // стартер, начало последовательности (сокращение или many-to-many)
+                MARKER_STARTER_TRIE => {
+                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    // маркер начала последовательности - 0xFF вместо CCC
-                    if last_ccc == MARKER_CCC_SEQUENCE {
-                        let node = TrieNode::from_slice(&self.tries, pos);
-                        previous = self.handle_starters_sequence(node, result, buffer, iter);
+                    previous = self.handle_starter_trie(codepoint, result, buffer, codepoints);
 
-                        continue;
-                    }
-
-                    // маркер слога хангыль является 0xFE вместо CCC
-                    if last_ccc == MARKER_CCC_HANGUL {
-                        // last_ccc = 0;
-                        println!("HANGUL!");
-                        todo!();
-                    }
-
-                    buffer.push(CollationElement {
-                        ccc: 0,
-                        code,
-                        value: CollationElementValue::Decomposition(pos),
-                    });
+                    // если буфер не пуст (содержит узел), то это означает, что возможно
+                    // продолжение последовательности с далее идущими нестартерами
+                    previous_ccc = match buffer.is_empty() {
+                        true => 0,
+                        false => 0xFF,
+                    };
                 }
                 // обычный нестартер, одинарные веса
                 MARKER_NONSTARTER_SINGLE_WEIGHTS => {
-                    let ccc = (data_value >> 36) as u8;
+                    let ce = codepoint.as_ce_single_weights();
 
-                    // декомпозицию делать всё-таки придётся
-                    last_ccc = match ccc < last_ccc {
+                    // потребуется декомпозиция - нарушен порядок CCC
+                    previous_ccc = match ce.ccc < previous_ccc {
                         true => 0xFF,
-                        false => ccc,
+                        false => ce.ccc,
                     };
 
-                    let weights = (data_value >> 4) as u32;
-
-                    buffer.push(CollationElement {
-                        ccc,
-                        code,
-                        value: CollationElementValue::SingleWeights(weights),
-                    });
+                    buffer.push(ce);
                 }
                 // нестартер - расширение, сокращение или декомпозиция
                 MARKER_NONSTARTER_TRIE => {
-                    last_ccc = 0xFF;
-
-                    let (pos, _) = parse_expansion_or_trie_info(data_value as u32);
-                    let mut trie_iter = TrieIter::new(&self.tries, pos as usize);
+                    let mut trie_iter = TrieIter::new(&self.tries, codepoint.data_pos());
 
                     while let Some(node) = trie_iter.next() {
-                        // P.S. единственный trie с потомками, который может попасть сюда - U+0F71 - TIBETAN VOWEL SIGN AA
-                        buffer.push(CollationElement {
-                            ccc: node.ccc(),
-                            code: node.code(),
-                            value: CollationElementValue::Trie(node.pos()),
-                        });
+                        let ccc = node.ccc();
+
+                        // кодпоинт - начало последовательности / обычное расширение
+                        // декомпозицию придётся делать, если нарушен порядок CCC или кодпоинт - начало последовательности
+                        match node.has_children() {
+                            true => {
+                                previous_ccc = 0xFF;
+
+                                buffer.push(node.as_ce_trie());
+                            }
+                            false => {
+                                previous_ccc = match ccc < previous_ccc {
+                                    true => 0xFF,
+                                    false => ccc,
+                                };
+
+                                buffer.push(node.as_ce_weights());
+                            }
+                        };
                     }
                 }
                 // вычисляемые веса
                 MARKER_IMPLICIT => {
-                    if !buffer.is_empty() {
-                        self.handle_buffer(result, buffer, last_ccc != 0xFF);
-                    }
-                    last_ccc = 0;
+                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    push_implicit_weights(code, result);
+                    result.extend_from_slice(&implicit_weights(codepoint.code));
+
+                    previous_ccc = 0;
                 }
                 _ => unreachable!(),
             }
-        }
-    }
-
-    /// запись о кодпоинте
-    #[inline(always)]
-    fn get_data_value(&self, code: u32) -> u64
-    {
-        let data_block_base = match code <= self.continuous_block_end {
-            true => 0x600 | (((code >> 3) as u16) & !0xF),
-            false => {
-                let mut group_index = (code >> 7) as u16;
-
-                // все кодпоинты, следующие за U+2FA1D имеют вычисляемые веса, не имеют декомпозиции
-                // кроме диапазона U+E0000 .. U+E01EF
-                if group_index > LAST_CODEPOINT_BLOCK {
-                    if IGNORABLES_BLOCKS.contains(&group_index) {
-                        group_index -= IGNORABLES_SHIFT;
-                    } else {
-                        return 0;
-                    }
-                };
-
-                self.index[group_index as usize]
-            }
-        };
-
-        let code_offsets = (code as u16) & 0x7F;
-        let data_block_index = data_block_base | (code_offsets >> 3) as u16;
-
-        let index = self.index[data_block_index as usize];
-        let data_index = ((index >> 1) | code_offsets & 0x7) as usize;
-
-        match index & 1 != 0 {
-            true => self.scalars64[data_index],
-            false => self.scalars32[data_index] as u64,
         }
     }
 
@@ -285,10 +252,14 @@ impl<'a> Collator<'a>
         simple_case: bool,
     )
     {
+        if buffer.is_empty() {
+            return;
+        }
+
         // декомпозиция не требуется: отдельно идущий кодпоинт с декомпозицией или кодпоинт с декомпозицией + нестартеры
         if simple_case {
-            // почему только Decomposition и SingleWeights: Trie записываются только с установлением флага обязательной
-            // декомпозиции, TrieWeights пишутся в буфер только в полной декомпозиции
+            // почему только Decomposition, SingleWeights и TrieWeights:
+            // CollationElementValue::Trie записываются только с установлением флага обязательной декомпозиции
             for ce in buffer.iter() {
                 match ce.value {
                     CollationElementValue::Decomposition(pos) => {
@@ -300,29 +271,25 @@ impl<'a> Collator<'a>
                             .for_each(|&w| result.push(w));
                     }
                     CollationElementValue::SingleWeights(weights) => result.push(weights),
+                    CollationElementValue::TrieWeights(pos, len) => {
+                        result.extend_from_slice(
+                            &self.tries[pos as usize .. pos as usize + len as usize],
+                        );
+                    }
                     _ => unreachable!(),
                 }
             }
 
             buffer.clear();
-
             return;
         }
 
-        // требуется декомпозиция и/или проверка сокращений/many-to-many
-
-        // один элемент в буфере - либо начало комбинаций, либо частный случай нестартеров
-        // почему не попадают:
-        //  - Decomposition: обработан в simple_case, т.к. имеем только один элемент
-        //  - TrieWeights: эти записи весов получаем при декомпозиции
+        // один элемент - никакой декомпозиции
         if buffer.len() == 1 {
             match buffer[0].value {
                 CollationElementValue::Trie(pos) => {
-                    let node = TrieNode::from_slice(&self.tries, pos);
-                    self.write_node_weights(node, result);
-                }
-                CollationElementValue::SingleWeights(weights) => {
-                    result.push(weights);
+                    let node = TrieNode::from(&self.tries, pos);
+                    result.extend_from_slice(node.weights(&self.tries));
                 }
                 _ => unreachable!(),
             }
@@ -331,116 +298,101 @@ impl<'a> Collator<'a>
             return;
         }
 
-        // делаем декомпозицию
+        // делаем декомпозицию и(или) сортируем по CCC
         if buffer[0].is_starter() {
-            // если в начале буфера - стартер, то он может оказаться только стартером с декомпозицией
-            // CollationElementValue::Decomposition включает в себя только случаи декомпозиции на 1 стартер + 1-3 нестартера
-
             let starter = self.decompose(buffer);
 
-            // если стартер может быть скомбинирован с нестартерами - сделаем это
+            // стартер может быть скомбинирован с нестартерами?
             if starter.has_children() {
                 self.handle_trie_nonstarters_sequence(starter, result, buffer);
                 return;
             }
 
-            self.write_node_weights(starter, result);
+            result.extend_from_slice(starter.weights(&self.tries));
         } else {
             buffer.sort_by_key(|ce| ce.ccc);
         }
 
-        self.write_buffer(buffer, result);
-        buffer.clear();
+        // во время записи будет проверен вариант с последовательностями, начинающихся с нестартера
+        self.flush_buffer(buffer, result);
     }
 
     /// пробуем искать последовательность (сокращение или many-to-many) с идущими следом стартерами
     #[inline(always)]
-    fn handle_starters_sequence(
+    fn handle_starter_trie(
         &self,
-        node: TrieNode,
+        codepoint: CodepointWithData,
         result: &mut Vec<u32>,
         buffer: &mut Vec<CollationElement>,
-        chars_iter: &mut CharsIter,
-    ) -> Option<(u32, u64)>
+        codepoints: &mut CodepointsIter,
+    ) -> Option<CodepointWithData>
     {
-        let mut node = node;
-        let mut trie_iter = TrieIter::new(&self.tries, node.next_offset() as usize);
+        let mut node = TrieNode::from(&self.tries, codepoint.data_pos());
+        let mut children = TrieIter::new(&self.tries, node.next_pos());
 
-        // если кодпоинт может быть объединён в последовательность только с нестартерами - отправляем его в буфер
-        if !trie_iter.current_node().is_starter() {
-            buffer.push(CollationElement {
-                ccc: 0,
-                code: node.code(),
-                value: CollationElementValue::Trie(node.pos()),
-            });
+        // среди потомков только нестартеры - отправляем узел в буфер
+        if !children.current_node().is_starter() {
+            buffer.push(node.as_ce_trie());
+
             return None;
         }
 
-        // получаем следующий элемент, если конец строки - дописываем результат
-        let (mut code, mut data_value, mut marker) =
-            self.get_next_or_write_to_result(node, result, chars_iter)?;
+        // получаем следующий кодпоинт
+        let mut second = codepoints.next_or_else(|| {
+            result.extend_from_slice(&node.weights(&self.tries));
+        })?;
 
         // встретили обычный стартер
-        if is_starter_marker(marker) {
+        if second.is_starter() {
             loop {
-                let iter_node = match trie_iter.next() {
-                    Some(iter_node) => iter_node,
-                    None => {
-                        // второй кодпоинт последовательности мог быть только стартером, но мы проверили все варианты
-                        self.write_node_weights(node, result);
-                        self.write_starter(data_value, result);
-                        return None;
-                    }
-                };
+                // следующий потомок текущего узла, не нашли - пишем веса текущиго узела + веса стартера
+                let child_node = children.next_or_else(|| {
+                    result.extend_from_slice(&node.weights(&self.tries));
+                    second.write_starter_weights(result, &self.expansions);
+                })?;
 
                 // нашли искомый стартер
-                if iter_node.code() == code {
-                    // потомков нет - значит, записываем последовательность
-                    if !(iter_node.has_children()) {
-                        self.write_node_weights(iter_node, result);
+                if child_node.code() == second.code {
+                    // потомков нет - записываем веса текущего узла
+                    if !(child_node.has_children()) {
+                        result.extend_from_slice(&child_node.weights(&self.tries));
+
                         return None;
                     }
 
-                    node = iter_node;
+                    // есть потомки - передвигаем указатель на узел, получаем следующий кодпоинт
+                    node = child_node;
 
-                    (code, data_value, marker) =
-                        self.get_next_or_write_to_result(node, result, chars_iter)?;
+                    second = codepoints.next_or_else(|| {
+                        result.extend_from_slice(&node.weights(&self.tries));
+                    })?;
 
                     // получили кодпоинт, который не является стартером - элементом последовательности
-                    if !is_starter_marker(marker) {
-                        buffer.push(CollationElement {
-                            ccc: 0,
-                            code: 0xFFFF,
-                            value: CollationElementValue::Trie(node.pos()),
-                        });
+                    if !second.is_starter() {
+                        buffer.push(node.as_ce_trie_node());
 
-                        return Some((code, data_value));
+                        return Some(second);
                     }
 
-                    // получили стартер - продолжаем цикл с новыми вводными
-                    trie_iter = TrieIter::new(&self.tries, node.next_offset() as usize);
+                    // получили стартер - продолжаем цикл с потомками нового узла
+                    children = TrieIter::new(&self.tries, node.next_pos());
                 }
 
                 // проверяемый стартер отсутствует среди возможных комбинаций
                 // пишем оба CE в результат
-                if iter_node.ccc() != 0 {
-                    self.write_node_weights(node, result);
-                    self.write_starter(data_value, result);
+                if child_node.ccc() != 0 {
+                    result.extend_from_slice(&node.weights(&self.tries));
+                    second.write_starter_weights(result, &self.expansions);
+
                     return None;
                 }
             }
         }
 
-        // кодпоинт не является стартером - элементом последовательности
-        // - пишем в буфер узел trie
-        // - кодпоинт отдаём обратно в цикл обработки
-        buffer.push(CollationElement {
-            ccc: 0,
-            code,
-            value: CollationElementValue::Trie(node.pos()),
-        });
+        // второй кодпоинт не является стартером - пишем в буфер узел, а кодпоинт отдаём обратно в цикл обработки
+        buffer.push(node.as_ce_trie_node());
 
-        Some((code, data_value))
+        Some(second)
     }
 
     /// ищем последовательность (сокращение или many-to-many) у стартера (или нестартера) и нестартеров (отсортированных по CCC)
@@ -453,30 +405,31 @@ impl<'a> Collator<'a>
     )
     {
         let mut node = node;
-        let mut trie_iter = TrieIter::new(&self.tries, node.next_offset() as usize);
+        let mut children = TrieIter::new(&self.tries, node.next_pos());
         let mut index = 0;
 
         // получаем первый кодпоинт из буфера
         let mut ce = match index < buffer.len() {
             true => buffer[index],
             false => {
-                self.write_node_weights(node, result);
+                result.extend_from_slice(&node.weights(&self.tries));
+
                 return;
             }
         };
 
         'outer: loop {
             loop {
-                // получаем следующий вариант комбинации в trie
-                let iter_node = match trie_iter.next() {
-                    Some(iter_node) => iter_node,
+                // получаем следующий вариант комбинации в дереве
+                let child_node = match children.next() {
+                    Some(child_node) => child_node,
                     None => break 'outer,
                 };
 
-                let trie_ccc = iter_node.ccc();
+                let child_ccc = child_node.ccc();
 
-                // CCC варианта в trie > CCC рассматриваемого кодпоинта из буфера
-                if trie_ccc > ce.ccc {
+                // CCC варианта в дереве > CCC рассматриваемого кодпоинта из буфера
+                if child_ccc > ce.ccc {
                     loop {
                         index += 1;
 
@@ -485,31 +438,31 @@ impl<'a> Collator<'a>
                             false => break 'outer,
                         };
 
-                        if ce.ccc >= trie_ccc {
+                        if ce.ccc >= child_ccc {
                             break;
                         }
                     }
                 }
 
                 // если совпадает CCC - выходим из цикл промотки
-                if trie_ccc == ce.ccc {
+                if child_ccc == ce.ccc {
                     break;
                 }
             }
 
             // совпадает CCC, сравниваем кодпоинты
             let code = ce.code;
-            let trie_code = trie_iter.current_node().code();
+            let child_code = children.current_node().code();
 
-            if code == trie_code {
+            if code == child_code {
                 buffer.remove(index);
-                node = trie_iter.current_node();
+                node = children.current_node();
 
                 if !node.has_children() {
                     break 'outer;
                 }
 
-                trie_iter = TrieIter::new(&self.tries, node.next_offset() as usize);
+                children = TrieIter::new(&self.tries, node.next_pos());
 
                 ce = match index < buffer.len() {
                     true => buffer[index],
@@ -518,64 +471,15 @@ impl<'a> Collator<'a>
             }
         }
 
-        self.write_node_weights(node, result);
-        self.write_buffer(buffer, result);
+        result.extend_from_slice(node.weights(&self.tries));
 
-        buffer.clear();
+        // запишем и очистим буфер
+        self.flush_buffer(buffer, result);
     }
 
-    /// получить следующий кодпоинт. если его нет - дописываем веса текущего кодпоинта в результат
+    /// записать веса из буффера, обработав случай нестартеров с декомпозицией, очистка буфера
     #[inline(always)]
-    fn get_next_or_write_to_result(
-        &self,
-        node: TrieNode,
-        result: &mut Vec<u32>,
-        iter: &mut CharsIter,
-    ) -> Option<(u32, u64, u8)>
-    {
-        let code = unsafe { utf8::next_char(iter) };
-
-        match code {
-            Some(code) => {
-                let data_value = self.get_data_value(code);
-                let marker = data_value as u8 & MARKER_MASK;
-
-                Some((code, data_value, marker))
-            }
-            None => {
-                self.write_node_weights(node, result);
-                return None;
-            }
-        }
-    }
-
-    /// дописать веса из узла trie
-    #[inline(always)]
-    fn write_node_weights(&self, node: TrieNode, result: &mut Vec<u32>)
-    {
-        result.extend_from_slice(
-            &self.tries[node.weights_offset() as usize .. node.next_offset() as usize],
-        );
-    }
-
-    /// записать веса стартера в результат
-    #[inline(always)]
-    fn write_starter(&self, data_value: u64, result: &mut Vec<u32>)
-    {
-        let marker = data_value as u8 & MARKER_MASK;
-
-        // стартеры, синглтоны
-        if marker == MARKER_STARTER_SINGLE_WEIGHTS {
-            result.push((data_value >> 4) as u32);
-        } else {
-            // расширения стартеров (MARKER_STARTER_EXPANSION)
-            result.extend_from_slice(self.get_starter_expansion_weights_slice(data_value as u32));
-        }
-    }
-
-    /// записать веса из буффера
-    #[inline(always)]
-    fn write_buffer(&self, buffer: &mut Vec<CollationElement>, result: &mut Vec<u32>)
+    fn flush_buffer(&self, buffer: &mut Vec<CollationElement>, result: &mut Vec<u32>)
     {
         let mut buffer_iter = buffer.iter();
 
@@ -588,7 +492,7 @@ impl<'a> Collator<'a>
                     );
                 }
                 CollationElementValue::Trie(pos) => {
-                    let node = TrieNode::from_slice(&self.tries, pos);
+                    let node = TrieNode::from(&self.tries, pos);
                     let mut buffer = buffer_iter.as_slice().to_owned();
 
                     if node.has_children() {
@@ -596,20 +500,13 @@ impl<'a> Collator<'a>
                         break;
                     }
 
-                    self.write_node_weights(node, result);
+                    result.extend_from_slice(node.weights(&self.tries));
                 }
                 _ => unreachable!(),
             }
         }
-    }
 
-    /// слайс весов расширения стартера
-    #[inline(always)]
-    fn get_starter_expansion_weights_slice(&self, data_value: u32) -> &[u32]
-    {
-        let (pos, len) = parse_expansion_or_trie_info(data_value);
-
-        &self.expansions[pos as usize .. pos as usize + len as usize]
+        buffer.clear();
     }
 
     /// декомпозиция буфера, возвращает стартер, буфер - нестартеры, отсортированные по CCC
@@ -617,29 +514,34 @@ impl<'a> Collator<'a>
     fn decompose(&self, buffer: &mut Vec<CollationElement>) -> TrieNode
     {
         let pos = match buffer[0].value {
+            // получаем указатель на декомпозицию - она записана сразу после основного узла
             CollationElementValue::Decomposition(pos) => {
-                TrieNode::from_slice(&self.tries, pos).next_offset()
+                TrieNode::from(&self.tries, pos).next_pos()
             }
+            // узел, полученный из обработки MARKER_STARTER_TRIE
             CollationElementValue::Trie(pos) => {
                 buffer.remove(0);
                 buffer.sort_by_key(|ce| ce.ccc);
 
-                return TrieNode::from_slice(&self.tries, pos);
+                return TrieNode::from(&self.tries, pos);
             }
             _ => unreachable!(),
         };
 
-        let mut trie_iter = TrieIter::new(&self.tries, pos as usize);
+        let mut decomposition = TrieIter::new(&self.tries, pos);
 
-        let starter = trie_iter.next().unwrap();
+        let starter = decomposition.next().unwrap();
 
         // стартер + нестартер - наиболее встречаемая комбинация, поэтому использование
         // дополнительного буфера для нестартеров декомпозиции может быть избыточным
 
-        buffer[0] = CollationElement::from(trie_iter.next().unwrap());
+        buffer[0] = decomposition.next().unwrap().as_ce_weights();
 
-        while let Some(nonstarter) = trie_iter.next() {
-            buffer.insert(1, CollationElement::from(nonstarter));
+        let mut i = 1;
+
+        while let Some(nonstarter) = decomposition.next() {
+            buffer.insert(i, nonstarter.as_ce_weights());
+            i += 1;
         }
 
         buffer.sort_by_key(|ce| ce.ccc);
@@ -666,58 +568,4 @@ impl<'a> Collator<'a>
     {
         Self::from_baked(data::cldr_und())
     }
-}
-
-/// если расширение: позиция + кол-во весов, если trie - позиция и CCC
-#[inline(always)]
-fn parse_expansion_or_trie_info(data_value: u32) -> (u16, u8)
-{
-    let pos = (data_value >> 4) as u16;
-    let len_or_ccc = (data_value >> 20) as u8;
-
-    (pos, len_or_ccc)
-}
-
-/// маркер стартера с весами
-#[inline(always)]
-fn is_starter_marker(marker: u8) -> bool
-{
-    marker == MARKER_STARTER_SINGLE_WEIGHTS || marker == MARKER_STARTER_EXPANSION
-}
-
-/// записать результат как последовательность u16
-#[inline(always)]
-fn output_weights(from: &Vec<u32>) -> Vec<u16>
-{
-    let mut primary = vec![];
-    let mut secondary = vec![];
-    let mut tetriary = vec![];
-
-    // веса L1, L2, L3 / маркер переменного веса как u32
-    // 1111 1111  1111 1111    2222 2222  2333 33v_
-
-    for &weights in from.iter() {
-        let l1 = weights as u16;
-        let l2 = (weights >> 16) as u16 & 0x1FF;
-        let l3 = (weights >> 25) as u16 & 0x1F;
-
-        if l1 != 0 {
-            primary.push(l1);
-        };
-
-        if l2 != 0 {
-            secondary.push(l2);
-        }
-
-        if l3 != 0 {
-            tetriary.push(l3);
-        }
-    }
-
-    primary.push(0);
-    primary.extend(secondary);
-    primary.push(0);
-    primary.extend(tetriary);
-
-    primary
 }
