@@ -1,6 +1,7 @@
 use codepoint::{CodepointWithData, CodepointsIter};
 use collation_element::{CollationElement, CollationElementValue};
 use data::WeightsData;
+use hangul::write_hangul_syllable;
 use implicit::implicit_weights;
 use slice::aligned::Aligned;
 use trie::{TrieIter, TrieNode};
@@ -13,6 +14,7 @@ mod implicit;
 mod slice;
 mod trie;
 mod weights;
+mod hangul;
 
 /// веса считаются алгоритмически
 pub const MARKER_IMPLICIT: u8 = 0b_000;
@@ -169,8 +171,7 @@ impl<'a> Collator<'a>
                     previous_ccc = match codepoint.ccc_or_len() {
                         // частный случай - слог хангыль
                         MARKER_CCC_HANGUL => {
-                            // TODO
-                            // self.handle_hangul_syllable(code, result);
+                            write_hangul_syllable(codepoint.code, result);
                             0
                         }
                         ccc => {

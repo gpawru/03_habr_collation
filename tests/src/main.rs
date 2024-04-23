@@ -9,14 +9,70 @@ use unicode_data::{
     COLLATION_TEST_DUCET_NON_IGNORABLE, UNICODE,
 };
 
+// в блоке чамо (U+1100..U+11FF) могут быть скомбинированы кодпоинты:
+//  - U+1100..=U+1112 (L, ведущие согласные)
+//  - U+1161..=U+1176 (V, гласные)
+//  - U+11A8..=U+11C3 (T, завершающие согласные)
+// все они находятся в пределах диапазона U+1100..=U+11C3 (196 кодпоинтов)
+
+/// начало блока ведущих согласных чамо
+const HANGUL_L_BASE: u32 = 0x1100;
+/// количество ведущих согласных
+const HANGUL_L_COUNT: u32 = 19;
+/// начало блока гласных чамо
+const HANGUL_V_BASE: u32 = 0x1161;
+/// количество гласных
+const HANGUL_V_COUNT: u32 = 21;
+/// начало блока завершающих согласных
+const HANGUL_T_BASE: u32 = 0x11A8;
+/// количество завершающих согласных
+const HANGUL_T_COUNT: u32 = 27;
+/// количество кодпоинтов на блок LV
+const HANGUL_T_BLOCK_SIZE: u32 = HANGUL_T_COUNT + 1;
+/// начало блока слогов хангыль
+const HANGUL_S_BASE: u32 = 0xAC00;
+/// количество слогов хангыль в Unicode
+const HANGUL_S_COUNT: u32 = 11172;
+/// количество гласных * количество завершающих согласных
+const HANGUL_N_COUNT: u32 = 588;
+
+#[test]
+fn jamo()
+{
+    let collator = Collator::cldr_und();
+
+    let ranges = (HANGUL_L_BASE .. HANGUL_L_BASE + HANGUL_L_COUNT)
+        .chain(0 .. 1)
+        .chain((HANGUL_V_BASE .. HANGUL_V_BASE + HANGUL_V_COUNT))
+        .chain(0 .. 1)
+        .chain((HANGUL_T_BASE .. HANGUL_T_BASE + HANGUL_T_COUNT));
+
+    for code in ranges {
+        if code == 0 {
+            println!();
+            continue;
+        }
+
+        let input = format!("{}", char::from_u32(code).unwrap());
+
+        let key = collator.get_weights(&input);
+
+        key.iter().for_each(|k| print!("{:04X} ", k));
+        println!();
+    }
+}
+
 #[test]
 fn test()
 {
     /*
-        77249. 0439 (0) 0334 (1)  - (й) CYRILLIC SMALL LETTER SHORT I
+        132226. AC00 (0) 0021 (0)  - (가) HANGUL SYLLABLE GA
+        test: 4323 43A1 0167 0000 0020 0020 0020 0000 0002 0002 0002 
+        key : 0167 0000 0020 0000 0002 
+
     */
     let collator = Collator::cldr_und();
-    let test_num = 77249;
+    let test_num = 132226;
 
     /*
 
