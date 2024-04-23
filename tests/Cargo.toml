@@ -1,0 +1,9 @@
+[package]
+name = "unicode_collation_tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+unicode_decomposing = { git = "https://github.com/gpawru/02_habr_decomposing_normalization" }
+unicode_data = { git = "https://github.com/gpawru/unicode_data" }
+unicode_collator = { path = "./../collator" }

@@ -1,0 +1,9 @@
+.idea/
+.vscode/
+target/
+.temp/
+/pub
+
+Cargo.lock
+.DS_Store
+
