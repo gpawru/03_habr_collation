@@ -15,9 +15,9 @@ mod codepoint;
 mod data;
 mod hangul;
 mod implicit;
+mod key;
 mod slice;
 mod trie;
-mod key;
 pub mod weights;
 
 /// веса считаются алгоритмически
@@ -132,7 +132,7 @@ impl<'a> Collator<'a>
 
         loop {
             // самый частый случай - последовательно идущие обычные стартеры, для них - цикл без избыточных проверок
-            let codepoint = match buffer.is_empty() {
+            let mut codepoint = match buffer.is_empty() {
                 true => match self.starters_loop(codepoints, result) {
                     Some(codepoint) => codepoint,
                     None => return,
@@ -146,103 +146,112 @@ impl<'a> Collator<'a>
                 },
             };
 
-            match codepoint.marker() {
-                // стартеры, синглтоны
-                MARKER_STARTER_SINGLE_WEIGHTS => {
-                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
+            let mut pending = None;
 
-                    result.push(codepoint.single_weights());
-
-                    previous_ccc = 0;
+            loop {
+                if pending.is_some() {
+                    codepoint = pending.unwrap();
+                    pending = None;
                 }
-                // расширения стартеров
-                MARKER_STARTER_EXPANSION => {
-                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    result.extend_from_slice(codepoint.expansion_weights(&self.expansions));
+                match codepoint.marker() {
+                    // стартеры, синглтоны
+                    MARKER_STARTER_SINGLE_WEIGHTS => {
+                        self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    previous_ccc = 0;
-                }
-                // декомпозиция, начинается со стартера
-                MARKER_STARTER_DECOMPOSITION => {
-                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
+                        result.push(codepoint.single_weights());
 
-                    previous_ccc = match codepoint.ccc_or_len() {
-                        // частный случай - слог хангыль
-                        MARKER_CCC_HANGUL => {
-                            write_hangul_syllable(codepoint.code, result);
-                            0
-                        }
-                        ccc => {
-                            buffer.push(codepoint.as_ce_decomposition());
-                            ccc
-                        }
-                    };
-                }
-                // стартер, начало последовательности (сокращение или many-to-many)
-                MARKER_STARTER_TRIE => {
-                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
-
-                    let result = self.handle_starter_trie(codepoint, result, buffer, codepoints);
-
-                    if let Some(codepoint) = result {
-                        codepoints.store(codepoint);
+                        previous_ccc = 0;
                     }
+                    // расширения стартеров
+                    MARKER_STARTER_EXPANSION => {
+                        self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    // если буфер не пуст (содержит узел), то это означает, что возможно
-                    // продолжение последовательности с далее идущими нестартерами
-                    previous_ccc = match buffer.is_empty() {
-                        true => 0,
-                        false => 0xFF,
-                    };
-                }
-                // обычный нестартер, одинарные веса
-                MARKER_NONSTARTER_SINGLE_WEIGHTS => {
-                    let ce = codepoint.as_ce_single_weights();
+                        result.extend_from_slice(codepoint.expansion_weights(&self.expansions));
 
-                    // потребуется декомпозиция - нарушен порядок CCC
-                    previous_ccc = match ce.ccc < previous_ccc {
-                        true => 0xFF,
-                        false => ce.ccc,
-                    };
+                        previous_ccc = 0;
+                    }
+                    // декомпозиция, начинается со стартера
+                    MARKER_STARTER_DECOMPOSITION => {
+                        self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    buffer.push(ce);
-                }
-                // нестартер - расширение, сокращение или декомпозиция
-                MARKER_NONSTARTER_TRIE => {
-                    let mut trie_iter = TrieIter::new(&self.tries, codepoint.data_pos());
-
-                    while let Some(node) = trie_iter.next() {
-                        let ccc = node.ccc();
-
-                        // кодпоинт - начало последовательности / обычное расширение
-                        // декомпозицию придётся делать, если нарушен порядок CCC или кодпоинт - начало последовательности
-                        match node.has_children() {
-                            true => {
-                                previous_ccc = 0xFF;
-
-                                buffer.push(node.as_ce_trie());
+                        previous_ccc = match codepoint.ccc_or_len() {
+                            // частный случай - слог хангыль
+                            MARKER_CCC_HANGUL => {
+                                write_hangul_syllable(codepoint.code, result);
+                                0
                             }
-                            false => {
-                                previous_ccc = match ccc < previous_ccc {
-                                    true => 0xFF,
-                                    false => ccc,
-                                };
-
-                                buffer.push(node.as_ce_weights());
+                            ccc => {
+                                buffer.push(codepoint.as_ce_decomposition());
+                                ccc
                             }
                         };
                     }
-                }
-                // вычисляемые веса
-                MARKER_IMPLICIT => {
-                    self.handle_buffer(result, buffer, previous_ccc != 0xFF);
+                    // стартер, начало последовательности (сокращение или many-to-many)
+                    MARKER_STARTER_TRIE => {
+                        self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    result.extend_from_slice(&implicit_weights(codepoint.code));
+                        pending = self.handle_starter_trie(codepoint, result, buffer, codepoints);
 
-                    previous_ccc = 0;
+                        // если буфер не пуст (содержит узел), то это означает, что возможно
+                        // продолжение последовательности с далее идущими нестартерами
+                        previous_ccc = match buffer.is_empty() {
+                            true => 0,
+                            false => 0xFF,
+                        };
+                    }
+                    // обычный нестартер, одинарные веса
+                    MARKER_NONSTARTER_SINGLE_WEIGHTS => {
+                        let ce = codepoint.as_ce_single_weights();
+
+                        // потребуется декомпозиция - нарушен порядок CCC
+                        previous_ccc = match ce.ccc < previous_ccc {
+                            true => 0xFF,
+                            false => ce.ccc,
+                        };
+
+                        buffer.push(ce);
+                    }
+                    // нестартер - расширение, сокращение или декомпозиция
+                    MARKER_NONSTARTER_TRIE => {
+                        let mut trie_iter = TrieIter::new(&self.tries, codepoint.data_pos());
+
+                        while let Some(node) = trie_iter.next() {
+                            let ccc = node.ccc();
+
+                            // кодпоинт - начало последовательности / обычное расширение
+                            // декомпозицию придётся делать, если нарушен порядок CCC или кодпоинт - начало последовательности
+                            match node.has_children() {
+                                true => {
+                                    previous_ccc = 0xFF;
+
+                                    buffer.push(node.as_ce_trie());
+                                }
+                                false => {
+                                    previous_ccc = match ccc < previous_ccc {
+                                        true => 0xFF,
+                                        false => ccc,
+                                    };
+
+                                    buffer.push(node.as_ce_weights());
+                                }
+                            };
+                        }
+                    }
+                    // вычисляемые веса
+                    MARKER_IMPLICIT => {
+                        self.handle_buffer(result, buffer, previous_ccc != 0xFF);
+
+                        result.extend_from_slice(&implicit_weights(codepoint.code));
+
+                        previous_ccc = 0;
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
+
+                if pending.is_none() {
+                    break;
+                }
             }
         }
     }
