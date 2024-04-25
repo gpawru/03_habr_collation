@@ -2,14 +2,14 @@ mod iter;
 
 pub use iter::CodepointsIter;
 
-use crate::collation_element::*;
+use crate::ce::*;
 use crate::{MARKER_STARTER_EXPANSION, MARKER_STARTER_SINGLE_WEIGHTS};
 
 /// битовая маска маркера хранимого значения информации о свойствах кодпоинта
 const MARKER_MASK: u8 = 0b_111;
 
 /// кодпоинт и сжатая информация о нём
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CodepointWithData
 {
     pub data: u64,

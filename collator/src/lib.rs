@@ -1,20 +1,24 @@
+use ce::{CollationElement, CollationElementValue};
 use codepoint::{CodepointWithData, CodepointsIter};
-use collation_element::{CollationElement, CollationElementValue};
 use data::WeightsData;
 use hangul::write_hangul_syllable;
 use implicit::implicit_weights;
+use key::{compose_key, Key};
+use options::CollatorOptions;
 use slice::aligned::Aligned;
 use trie::{TrieIter, TrieNode};
-use weights::output_weights;
 
+pub mod options;
+
+mod ce;
 mod codepoint;
-mod collation_element;
 mod data;
+mod hangul;
 mod implicit;
 mod slice;
 mod trie;
-mod weights;
-mod hangul;
+mod key;
+pub mod weights;
 
 /// веса считаются алгоритмически
 pub const MARKER_IMPLICIT: u8 = 0b_000;
@@ -52,6 +56,8 @@ pub struct Collator<'a>
     index: Aligned<'a, u16>,
     /// с U+0000 и до этого кодпоинта включительно блоки в data идут последовательно
     continuous_block_end: u32,
+    /// опции
+    options: CollatorOptions,
 }
 
 impl<'a> Collator<'a>
@@ -59,12 +65,12 @@ impl<'a> Collator<'a>
     /// создать ключ сопоставления
     /// TODO: добавить опции
     #[inline(never)]
-    pub fn get_key(&self, input: &str, _options: bool) -> Vec<u16>
+    pub fn get_key(&self, input: &str) -> Key
     {
         let result = self.get_weights(input);
 
         // сформируем ключ
-        output_weights(&result)
+        compose_key(&result, self.options)
     }
 
     /// ключ как вектор весов
@@ -123,28 +129,21 @@ impl<'a> Collator<'a>
     )
     {
         let mut previous_ccc = 0;
-        let mut previous = None;
 
         loop {
             // самый частый случай - последовательно идущие обычные стартеры, для них - цикл без избыточных проверок
-            let codepoint = match previous {
-                None => match buffer.is_empty() {
-                    true => match self.starters_loop(codepoints, result) {
-                        Some(codepoint) => codepoint,
-                        None => return,
-                    },
-                    false => match codepoints.next() {
-                        Some(codepoint) => codepoint,
-                        None => {
-                            self.handle_buffer(result, buffer, previous_ccc != 0xFF);
-                            return;
-                        }
-                    },
+            let codepoint = match buffer.is_empty() {
+                true => match self.starters_loop(codepoints, result) {
+                    Some(codepoint) => codepoint,
+                    None => return,
                 },
-                Some(codepoint) => {
-                    previous = None;
-                    codepoint
-                }
+                false => match codepoints.next() {
+                    Some(codepoint) => codepoint,
+                    None => {
+                        self.handle_buffer(result, buffer, previous_ccc != 0xFF);
+                        return;
+                    }
+                },
             };
 
             match codepoint.marker() {
@@ -184,7 +183,11 @@ impl<'a> Collator<'a>
                 MARKER_STARTER_TRIE => {
                     self.handle_buffer(result, buffer, previous_ccc != 0xFF);
 
-                    previous = self.handle_starter_trie(codepoint, result, buffer, codepoints);
+                    let result = self.handle_starter_trie(codepoint, result, buffer, codepoints);
+
+                    if let Some(codepoint) = result {
+                        codepoints.store(codepoint);
+                    }
 
                     // если буфер не пуст (содержит узел), то это означает, что возможно
                     // продолжение последовательности с далее идущими нестартерами
@@ -300,7 +303,7 @@ impl<'a> Collator<'a>
         }
 
         // делаем декомпозицию и(или) сортируем по CCC
-        if buffer[0].is_starter() {
+        if buffer[0].ccc == 0 {
             let starter = self.decompose(buffer);
 
             // стартер может быть скомбинирован с нестартерами?
@@ -550,9 +553,14 @@ impl<'a> Collator<'a>
         starter
     }
 
+    /// новый коллатор
+    pub fn new(options: CollatorOptions) -> Self
+    {
+        Self::from_baked(data::cldr_und(), options)
+    }
+
     /// создать коллатор из заранее подготовленных данных
-    #[inline(never)]
-    pub fn from_baked(weights_data: WeightsData) -> Self
+    pub fn from_baked(weights_data: WeightsData, options: CollatorOptions) -> Self
     {
         Self {
             scalars64: Aligned::from(weights_data.scalars64),
@@ -561,12 +569,7 @@ impl<'a> Collator<'a>
             expansions: Aligned::from(weights_data.expansions),
             tries: Aligned::from(weights_data.tries),
             continuous_block_end: weights_data.continuous_block_end,
+            options,
         }
-    }
-
-    /// CLDR undefined
-    pub fn cldr_und() -> Self
-    {
-        Self::from_baked(data::cldr_und())
     }
 }

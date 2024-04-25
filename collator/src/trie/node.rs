@@ -1,4 +1,4 @@
-use crate::collation_element::{CollationElement, CollationElementValue};
+use crate::ce::{CollationElement, CollationElementValue};
 
 /// узел бора весов
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +97,7 @@ impl TrieNode
     {
         CollationElement {
             ccc: 0,
-            code: 0xFFFF,
+            code: 0,
             value: CollationElementValue::Trie(self.pos()),
         }
     }

@@ -1,26 +1,61 @@
-#[derive(Debug, Copy, Clone, Eq, PartialOrd, Ord)]
+// все опции - см. UTS #35, https://www.unicode.org/reports/tr35/tr35-collation.html
+
+mod compressed;
+
+pub use compressed::CollatorOptionsValue;
+
+/// уровень сравнения
 #[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Strength
 {
-    Primary = 0b_000,
-    Secondary = 0b_001,
-    Tetriary = 0b_010,
-    Quaternary = 0b_011,
-    Identical = 0b_111,
+    Primary = 1,    // базовые символы
+    Secondary = 2,  // диакритические знаки
+    Tetriary = 3,   // регистр / варианты
+    Quaternary = 4, // пунктуация
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialOrd, Ord)]
+/// тип сравнения переменных весов
 #[repr(u8)]
-pub enum CaseFirst
+#[derive(Debug, Clone, Copy)]
+pub enum AlternateHandling
 {
-    Off = 0,
-    LowerFirst = 1,
-    UpperFirst = 2,
+    NonIgnorable = 0, // переменные веса не игнорируются
+    Shifted = 1,      // со сдвигом переменных весов
 }
 
 #[derive(Debug, Copy, Clone)]
 pub struct CollatorOptions
 {
-    pub strength: Option<Strength>,
-    pub case_first: Option<CaseFirst>,
+    /// уровень сравнения
+    pub strength: Strength,
+    /// тип сравнения
+    pub alternate: AlternateHandling,
+}
+
+impl Default for Strength
+{
+    fn default() -> Self
+    {
+        Self::Tetriary
+    }
+}
+
+impl Default for AlternateHandling
+{
+    fn default() -> Self
+    {
+        Self::NonIgnorable
+    }
+}
+
+impl Default for CollatorOptions
+{
+    fn default() -> Self
+    {
+        Self {
+            strength: Default::default(),
+            alternate: Default::default(),
+        }
+    }
 }

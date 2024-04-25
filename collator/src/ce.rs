@@ -19,13 +19,3 @@ pub enum CollationElementValue
     /// элемент с весами, записанными в таблице tries
     TrieWeights(u16, u8),
 }
-
-impl CollationElement
-{
-    /// стартер?
-    #[inline(always)]
-    pub fn is_starter(&self) -> bool
-    {
-        self.ccc == 0
-    }
-}

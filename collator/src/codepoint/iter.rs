@@ -11,6 +11,8 @@ const IGNORABLES_SHIFT: u16 = 0x160B;
 pub struct CodepointsIter<'a>
 {
     iter: core::str::Chars<'a>,
+    /// используем, когда нужно сохранить кодпоинт до следующего цикла
+    stored: Option<CodepointWithData>,
     /// стартеры и нестартеры с одинарными весами
     scalars64: &'a [u64],
     /// декомпозиции, сокращения и т.д.
@@ -29,10 +31,19 @@ impl<'a> Iterator for CodepointsIter<'a>
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item>
     {
-        let code = self.iter.next()? as u32;
-        let data = self.get_data_value(code);
+        match self.stored {
+            None => {
+                let code = self.iter.next()? as u32;
+                let data = self.get_data_value(code);
 
-        Some(CodepointWithData { data, code })
+                Some(CodepointWithData { data, code })
+            }
+            Some(stored) => {
+                self.stored = None;
+
+                Some(stored)
+            }
+        }
     }
 }
 
@@ -88,6 +99,13 @@ impl<'a> CodepointsIter<'a>
         }
     }
 
+    /// сохранить кодпоит, чтобы получить его в на следующей итерации
+    #[inline(always)]
+    pub fn store(&mut self, value: CodepointWithData)
+    {
+        self.stored = Some(value);
+    }
+
     /// итератор по кодпоинтам строки, с данными о весах, декомпозиции, последовательностях
     pub fn new(
         input: &'a str,
@@ -99,6 +117,7 @@ impl<'a> CodepointsIter<'a>
     {
         Self {
             iter: input.chars(),
+            stored: None,
             scalars64,
             scalars32,
             index,
