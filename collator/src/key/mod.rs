@@ -1,17 +1,26 @@
+use core::cmp::Ordering;
+
 use crate::{options::*, weights::Weights};
 
-/// ключ сопоставления с дополнительной информацией о нём
-#[derive(Clone)]
-pub struct Key
+mod key;
+
+pub use key::Key;
+
+/// сравнение ключей
+#[inline]
+pub fn compare_keys(a: &Vec<u16>, b: &Vec<u16>) -> Ordering
 {
-    /// u16 веса
-    pub weights: Vec<u16>,
-    /// кол-во весов первичного уровня
-    pub l1_len: usize,
-    /// кол-во весов вторичного уровня
-    pub l2_len: usize,
-    /// кол-во весов третичного уровня
-    pub l3_len: usize,
+    if a == b {
+        return Ordering::Equal;
+    }
+
+    let common_len = core::cmp::min(a.len(), b.len());
+
+    match a[.. common_len].cmp(&b[.. common_len]) {
+        Ordering::Less => Ordering::Less,
+        Ordering::Equal => a.len().cmp(&b.len()),
+        Ordering::Greater => Ordering::Greater,
+    }
 }
 
 /// создать ключ из u32-весов

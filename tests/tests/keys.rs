@@ -1,9 +1,7 @@
-use std::cmp::Ordering;
+use core::cmp::Ordering;
 
 use unicode_collator::{
-    options::{AlternateHandling, CollatorOptions, Strength},
-    weights::Weights,
-    Collator,
+    key::compare_keys, options::{AlternateHandling, CollatorOptions, Strength}, weights::Weights, Collator
 };
 use unicode_data::{CollationTest, COLLATION_TEST_CLDR_NON_IGNORABLE, COLLATION_TEST_CLDR_SHIFTED};
 
@@ -127,19 +125,4 @@ fn test_to_key(test: &CollationTest, levels: u8) -> Vec<u16>
     append!(2, l2, 3, l3, 4, l4);
 
     return key;
-}
-
-fn compare_keys(a: &Vec<u16>, b: &Vec<u16>) -> Ordering
-{
-    if a == b {
-        return Ordering::Equal;
-    }
-
-    let common_len = core::cmp::min(a.len(), b.len());
-
-    match a[.. common_len].cmp(&b[.. common_len]) {
-        Ordering::Less => Ordering::Less,
-        Ordering::Equal => a.len().cmp(&b.len()),
-        Ordering::Greater => Ordering::Greater,
-    }
 }

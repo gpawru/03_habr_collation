@@ -15,7 +15,7 @@ mod codepoint;
 mod data;
 mod hangul;
 mod implicit;
-mod key;
+pub mod key;
 mod slice;
 mod trie;
 pub mod weights;
